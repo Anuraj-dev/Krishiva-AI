@@ -1,311 +1,175 @@
-# Krishiva AI
+<p align="center">
+  <img src="frontend/src/app/icon.svg" alt="Krishiva AI logo" width="88" height="88" />
+</p>
 
-> A farmer's conversational crop-advisory assistant. Ask about a crop problem in
-> plain language — English, Hindi, Bengali, or Assamese — and get a grounded,
-> cited answer with a confidence-scored diagnosis, drawn from a curated
-> agricultural knowledge base rather than an open-ended model guess.
+<h1 align="center">Krishiva AI</h1>
 
-**Status: MVP v1.** The knowledge base currently covers **six rice diseases**
-with a regional focus on **Assam / Northeast India**. Everything runs locally —
-retrieval, reranking, and generation can all happen on your machine with no
-external API required.
+<p align="center">
+  A crop advisory chat for farmers in English, Hindi, Bengali and Assamese.<br />
+  Each answer cites the knowledge it used and comes with a confidence-scored diagnosis.
+</p>
 
----
+<p align="center">
+  <a href="#running-it">Run it locally</a>
+  ·
+  <a href="#api">API</a>
+  ·
+  <a href="#configuration">Configuration</a>
+</p>
 
-## What it does
+Krishiva answers a farmer's question about a crop problem. You describe what you see on the plant in plain words. Krishiva searches a knowledge base for matching chunks, names the most likely problem with a 0 to 1 confidence score, and writes the answer from those chunks. The confidence score comes from the retrieval scores, not from the language model.
 
-A farmer describes what they see — *"yellow diamond-shaped spots on my paddy
-leaf after the foggy nights"* — and Krishiva:
+It has three parts: a Python knowledge engine, a FastAPI backend that serves `POST /api/v1/query`, and a Next.js web client. Retrieval and reranking run on your machine. The answer step uses a local OpenAI-compatible server, the Anthropic API, or no model at all. You need Python 3.14 with uv to run the backend and Node.js to run the web client.
 
-1. **Detects the language** of the query (en / hi / bn / as).
-2. **Retrieves** the most relevant knowledge chunks using hybrid search (dense
-   vectors + BM25) with cross-encoder reranking.
-3. **Derives a diagnosis** deterministically from the retrieval evidence —
-   *problem + a 0–1 confidence score* — so the confidence shown is grounded in
-   the retrieved sources, not the model's self-assessment.
-4. **Generates a grounded answer** with an LLM, constrained to the retrieved
-   knowledge, in the farmer's language.
-5. **Returns citations** to the exact knowledge entries used.
+## What you get
 
-The knowledge is authored for how farmers actually speak: each disease entry
-carries farmer phrases and analogies in four languages, disambiguation trees
-("is it Blast or Brown Spot?"), scientific symptoms, region-specific seasonal
-risk calendars, and concrete management steps (cultural, biological, chemical
-with doses).
+- **Hybrid search with reranking.** Dense BGE embeddings and BM25 run in one Qdrant query, fused with reciprocal rank fusion. A cross-encoder rescores the top 20 candidates. Each problem contributes up to three chunks before the rest fill in, so competing diagnoses stay visible.
+- **A confidence score from the evidence.** The score blends three signals: the top match's reranker probability, its margin over the best competing problem, and the share of retrieved chunks that agree with it. The model does not set the score. If the top match scores below 0.15, the response has no diagnosis.
+- **Language from the query.** Devanagari text is answered in Hindi. Bengali script is Bengali, unless the text contains ৰ or ৱ, which only Assamese uses. Everything else is English. A `language` field in the request overrides detection.
+- **Crop hints that never block a search.** A `crop` value filters the index to that crop. If nothing matches, the search runs again without the filter.
+- **Answers without a model.** The `extractive` provider builds the answer from the retrieved text, up to 900 characters. It also takes over when the configured provider fails to start.
+- **Sources and request IDs.** Each response lists up to five sources with an id, title and score. Every request gets an ID. It comes back in the response body and in the `X-Request-ID` header, and the server log lines for that request carry it too.
+- **A chat client that keeps data in the browser.** Conversations, the farm profile and UI settings are saved in localStorage under `krishiva.conversations`, `krishiva.farm` and `krishiva.ui`. The backend keeps no conversation history.
 
----
+## Running it
 
-## Architecture
-
-Krishiva is a monorepo with three cleanly separated layers:
-
-```
-┌──────────────┐     POST /api/v1/query      ┌──────────────┐        ┌────────────────┐
-│   frontend   │ ──────────────────────────▶ │   backend    │ ─────▶ │     engine     │
-│  Next.js 16  │ ◀────────────────────────── │   FastAPI    │ ◀───── │  RAG pipeline  │
-│  React 19    │   { answer, diagnosis,      │              │        │                │
-└──────────────┘     sources, language }     └──────────────┘        └───────┬────────┘
-                                                                             │
-                                              ┌──────────────────────────────┼──────────────┐
-                                              │                              │              │
-                                       ┌──────▼──────┐              ┌────────▼───────┐  ┌───▼────┐
-                                       │  Retrieval  │              │   Generation   │  │   KB   │
-                                       │ dense+BM25  │              │  LLM / extract │  │  JSON  │
-                                       │  + reranker │              │  + diagnosis   │  │        │
-                                       └──────┬──────┘              └────────────────┘  └────────┘
-                                       ┌──────▼───────┐
-                                       │ Qdrant (emb) │
-                                       │ vector store │
-                                       └──────────────┘
-```
-
-- **`engine/`** — the knowledge engine. A self-contained RAG pipeline with no
-  backend dependency: knowledge-base loading/validation, indexing, hybrid
-  retrieval + reranking, deterministic diagnosis, and LLM generation.
-- **`backend/`** — a thin FastAPI service. Exposes `POST /api/v1/query`, adapts
-  the engine's DTOs to a stable HTTP wire contract, and degrades gracefully to a
-  deterministic stub engine if the real one can't load.
-- **`frontend/`** — a Next.js web client (chat UI, diagnosis cards, source
-  citations, language picker, farm profile). See
-  [`frontend/README.md`](frontend/README.md) for details.
-- **`data/`** — the knowledge bases (`data/knowledge/`) and the built vector
-  index (`data/vector_store/`).
-
-### The engine pipeline
-
-```
-query
-  → detect language
-  → hybrid retrieve (dense BGE embeddings + BM25 sparse, RRF fusion)
-  → cross-encoder rerank (bge-reranker-base)
-  → problem-diversity cap (so competing diagnoses surface)
-  → derive diagnosis (deterministic heuristic over retrieval scores)
-  → assemble prompt from retrieved chunks
-  → LLM synthesises a grounded answer
-  → EngineAnswer (answer + language + diagnosis + citations)
-```
-
-### LLM providers
-
-The generator is swappable via `KRISHIVA_LLM_PROVIDER`:
-
-| Provider        | What it uses                                              |
-|-----------------|----------------------------------------------------------|
-| `openai_compat` | A local OpenAI-compatible server — **LM Studio** (default), Ollama, or vLLM. This is the default for local dev (Qwen3 4B). |
-| `anthropic`     | The Claude API (needs `ANTHROPIC_API_KEY`).              |
-| `extractive`    | No LLM. Stitches an answer directly from the retrieved knowledge — keeps the app functional offline / with no key. |
-| `auto`          | Anthropic if a key is set, otherwise `extractive`.       |
-
-If a configured provider fails to initialise, the engine logs a warning and
-falls back to the extractive generator rather than crashing.
-
----
-
-## Tech stack
-
-**Backend / engine (Python 3.14, managed with [uv](https://docs.astral.sh/uv/))**
-- FastAPI + Uvicorn
-- Pydantic / pydantic-settings
-- sentence-transformers (`BAAI/bge-small-en-v1.5` embeddings, `BAAI/bge-reranker-base` reranker)
-- Qdrant (embedded, on-disk) vector store
-- `rank-bm25` for sparse retrieval
-- Anthropic SDK / httpx (for local OpenAI-compatible servers)
-- loguru, orjson
-
-**Frontend (Node)**
-- Next.js 16 (App Router) + React 19 + TypeScript
-- Tailwind CSS v4, Zustand, TanStack Query
-- react-markdown, lucide-react
-
----
-
-## Getting started
+Krishiva is not packaged. You run the backend and the web client from a clone of this repo.
 
 ### Prerequisites
 
-- **Python 3.14** and **[uv](https://docs.astral.sh/uv/)**
-- **Node.js** (for the frontend)
-- *(Optional)* **[LM Studio](https://lmstudio.ai/)** running a local model
-  (e.g. Qwen3 4B) for full conversational answers. Without it, the engine uses
-  the extractive fallback.
+- Python 3.14 and [uv](https://docs.astral.sh/uv/)
+- Node.js with npm
+- Optionally, [LM Studio](https://lmstudio.ai/) with a model loaded and its local server running
 
 ### 1. Configure
 
-```bash
+```sh
 cp .env.example .env
 ```
 
-The defaults target a local LM Studio server at `http://localhost:1234/v1`. To
-run with no LLM at all, set `KRISHIVA_LLM_PROVIDER=extractive`.
+`.env.example` selects the `openai_compat` provider, so the backend expects a model server at `http://localhost:1234/v1`, which is LM Studio's default. Load `qwen/qwen3-4b` in LM Studio and start its server, or set `KRISHIVA_LLM_MODEL` to the id your server reports. To run without any model server, set `KRISHIVA_LLM_PROVIDER=extractive`. If the model server is down when a query arrives, the API returns `502` with the code `engine_error`.
 
-### 2. Install dependencies & build the vector index
+### 2. Build the knowledge index
 
-```bash
+```sh
 uv sync
 uv run python scripts/build_index.py
 ```
 
-The first run downloads the embedding and reranker models and builds the Qdrant
-index from `data/knowledge/`. This is an offline step — don't run it while the
-backend is holding the same store open (the embedded store is single-writer).
+The repository does not include knowledge base files. Put your JSON knowledge bases under `data/knowledge/`, at any depth, or point `KRISHIVA_KB_DIR` at them. The build reads every `*.json` file there, embeds the chunks and writes the Qdrant store to `data/vector_store/`. Without any JSON files, the script stops with `No knowledge JSON files found`. The build downloads the embedding model on first run. The reranker downloads on the first query.
 
-### 3. Run the backend
+Stop the backend before you rebuild. The embedded Qdrant store allows one writer.
 
-```bash
-uv run python main.py          # → http://127.0.0.1:8000
+### 3. Start the backend
+
+```sh
+uv run python main.py
 ```
 
-Interactive API docs: <http://127.0.0.1:8000/docs>.
+The backend listens on `http://127.0.0.1:8000` and reloads on code changes. The interactive API docs are at `http://127.0.0.1:8000/docs`.
 
-### 4. Run the frontend
+### 4. Start the web client
 
-```bash
+```sh
 cd frontend
 npm install
-cp .env.example .env.local     # points NEXT_PUBLIC_API_BASE_URL at the backend
-npm run dev                    # → http://localhost:3000
+npm run dev
 ```
 
----
+The client serves `http://localhost:3000` and calls the backend at `http://127.0.0.1:8000`. To point it at another backend, set `NEXT_PUBLIC_API_BASE_URL` in `frontend/.env.local`.
+
+## How it works
+
+`engine/` is the knowledge engine. It has no dependency on the backend. `backend/` adapts the engine to the HTTP contract. `frontend/` is the web client. A knowledge base is a JSON file of chunks. Each chunk has one type: farmer entry, scientific symptom, management, disambiguation, regional context or synonym expansion.
+
+A query goes through these steps:
+
+1. Detect the language from the script, or use the request's hint.
+2. Embed the query with `BAAI/bge-small-en-v1.5` and encode it as BM25 terms.
+3. Run one Qdrant query over both vectors and fuse the results with reciprocal rank fusion. Keep the top 20.
+4. Rerank with `BAAI/bge-reranker-base`, then cap each problem at three chunks.
+5. Derive the diagnosis from the chunk scores. No model call is involved.
+6. Build the prompt from the chunks, the diagnosis and the question, then send it to the answer provider.
+7. Return the answer, the language, the diagnosis and up to five sources.
+
+The system prompt limits the assistant to smallholder farmers in Assam and Northeast India. It tells the model to answer only from the retrieved chunks and to say so when they do not cover the question.
+
+## Configuration
+
+Every setting is an environment variable. Keep `.env` in the directory you run the commands from, which is the repo root. The defaults below come from the code. `.env.example` overrides some of them for LM Studio.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `KRISHIVA_LLM_PROVIDER` | `auto` | `auto`, `anthropic`, `openai_compat` or `extractive`. `auto` uses `anthropic` when `ANTHROPIC_API_KEY` is set and `extractive` otherwise. |
+| `KRISHIVA_LLM_BASE_URL` | `http://localhost:1234/v1` | Endpoint for `openai_compat`. Works with LM Studio, Ollama and vLLM. |
+| `KRISHIVA_LLM_MODEL` | `claude-opus-4-8` | Model id. Set it to the id your local server reports. `.env.example` sets `qwen/qwen3-4b`. |
+| `KRISHIVA_LLM_API_KEY` | `lm-studio` | Bearer token sent to the local server. |
+| `KRISHIVA_LLM_MAX_TOKENS` | `1200` | Output token cap for both providers. |
+| `KRISHIVA_LLM_DISABLE_THINKING` | `true` | Adds `/no_think` to the system prompt for reasoning models such as Qwen3. |
+| `KRISHIVA_USE_LLM` | `true` | Set to `0` to skip the model and use `extractive`. |
+| `ANTHROPIC_API_KEY` | none | Required for the `anthropic` provider. |
+| `KRISHIVA_KB_DIR` | `data/knowledge` | Where `build_index.py` looks for knowledge JSON. |
+| `KRISHIVA_VECTOR_STORE_PATH` | `data/vector_store` | Location of the embedded Qdrant store. |
+| `KRISHIVA_COLLECTION_NAME` | `krishiva_kb` | Qdrant collection name. |
+| `KRISHIVA_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Dense embedding model. Rebuild the index after changing it. |
+| `KRISHIVA_RERANKER_MODEL` | `BAAI/bge-reranker-base` | Cross-encoder reranker. An empty value turns reranking off. |
+| `KRISHIVA_TOP_K` | `6` | Chunks retrieved per query and passed to the answer step. |
+| `KRISHIVA_USE_REAL_ENGINE` | `1` | Set to `0` to serve the stub engine. The backend also falls back to the stub when the real engine fails to build. The stub returns a fixed Rice Blast answer. |
+| `KRISHIVA_LOG_LEVEL` | `INFO` | Log level. |
+| `KRISHIVA_CORS_ORIGINS` | `["*"]` | JSON list of allowed origins. Set an explicit list outside local development. |
 
 ## API
 
-### `GET /health`
+### GET /health
 
-Liveness probe. Returns `{ "status": "ok", "version": "..." }`.
+Returns the liveness payload `{"status": "ok", "version": "0.1.0"}`.
 
-### `POST /api/v1/query`
+### POST /api/v1/query
 
-Answer a single farmer query.
+```sh
+curl -s http://127.0.0.1:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "yellow diamond spots on my paddy leaf after foggy nights", "language": "en", "region": "Assam", "crop": "rice"}'
+```
 
-**Request**
+Only `query` is required. It takes 1 to 1000 characters. `language` is one of `en`, `hi`, `bn` or `as`. `region` goes into the prompt as context. `crop` narrows the search, and `region` and `crop` take up to 100 characters each.
+
+The response has this shape. The values depend on your knowledge base.
 
 ```json
 {
   "query": "yellow diamond spots on my paddy leaf after foggy nights",
   "language": "en",
-  "region": "Assam",
-  "crop": "rice"
+  "answer": "<answer text>",
+  "diagnosis": { "problem": "<problem name>", "confidence": 0.87 },
+  "sources": [{ "id": "<chunk id>", "title": "<chunk title>", "score": 0.94 }],
+  "request_id": "<request id>"
 }
 ```
 
-`language`, `region`, and `crop` are optional. When `language` is omitted the
-engine detects it; a non-matching `crop` hint is ignored rather than returning
-nothing.
+`diagnosis` is `null` when the top match is too weak to name a problem.
 
-**Response**
+Errors use one envelope, `{"error": {"code", "message", "request_id"}}`. Stack traces never reach the client.
 
-```json
-{
-  "query": "yellow diamond spots on my paddy leaf after foggy nights",
-  "language": "en",
-  "answer": "This looks like Rice Blast…",
-  "diagnosis": { "problem": "Rice Blast", "confidence": 0.87 },
-  "sources": [
-    { "id": "blast_farmer_entry_leaf_001", "title": "…", "score": 0.94 }
-  ],
-  "request_id": "…"
-}
-```
-
-Errors are returned as a structured envelope:
-`{ "error": { "code", "message", "request_id" } }`.
-
----
-
-## Knowledge coverage (v1)
-
-Six rice diseases, each a multi-chunk JSON knowledge base with multilingual
-farmer phrases, disambiguation logic, scientific symptoms, Assam-specific
-seasonal context, and management protocols:
-
-| Disease        | Pathogen / type            |
-|----------------|----------------------------|
-| Rice Blast     | *Magnaporthe oryzae* (fungal) |
-| Brown Spot     | Fungal leaf spot           |
-| False Smut     | Fungal grain disease       |
-| Sheath Blight  | Fungal                     |
-| Sheath Rot     | Fungal                     |
-| Stem Rot       | Fungal                     |
-
-**Languages:** English (`en`), Hindi (`hi`), Bengali (`bn`), Assamese (`as`).
-
-Sources cited in the knowledge base include ICAR-AAU Jorhat, IRRI, CRRI Cuttack,
-and SAU Assam.
-
----
-
-## Configuration reference
-
-All settings are environment variables (see [`.env.example`](.env.example)):
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `KRISHIVA_LLM_PROVIDER` | `openai_compat` | `auto` / `anthropic` / `openai_compat` / `extractive` |
-| `KRISHIVA_LLM_BASE_URL` | `http://localhost:1234/v1` | Local model server (LM Studio / Ollama / vLLM) |
-| `KRISHIVA_LLM_MODEL` | `qwen/qwen3-4b` | Model id as reported by your server |
-| `KRISHIVA_LLM_MAX_TOKENS` | `1500` | Generation cap |
-| `KRISHIVA_LLM_DISABLE_THINKING` | `1` | Inject `/no_think` for reasoning models (Qwen3) |
-| `ANTHROPIC_API_KEY` | — | Required only for `provider=anthropic` |
-| `KRISHIVA_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Dense embedding model |
-| `KRISHIVA_RERANKER_MODEL` | `BAAI/bge-reranker-base` | Cross-encoder reranker (empty to disable) |
-| `KRISHIVA_TOP_K` | `6` | Chunks returned per query |
-| `KRISHIVA_USE_REAL_ENGINE` | `1` | Set `0` to force the deterministic stub engine |
-| `KRISHIVA_LOG_LEVEL` | `INFO` | Log verbosity |
-| `KRISHIVA_CORS_ORIGINS` | `["*"]` | Allowed CORS origins |
-
----
+| Status | Code | When |
+| --- | --- | --- |
+| 422 | `validation_error` | The body fails validation, for example an empty query or an unsupported `language`. |
+| 502 | `engine_error` | The engine failed, for example because the model server is unreachable. |
 
 ## Development
 
-```bash
-# Tests
+```sh
 uv run pytest
-
-# Lint / format / type-check
 uv run ruff check .
 uv run ruff format .
 uv run mypy .
 ```
 
-The `scripts/` directory holds standalone verification scripts for each engine
-layer (loader, parser, validator, embedder, retriever, formatter, backend,
-end-to-end), useful for debugging a single stage in isolation — e.g.
-`uv run python scripts/verify_engine.py`.
+The test suite has two modules, one for the query API and one for the knowledge base models. The scripts in `scripts/` check one layer each. Run one with `uv run python scripts/verify_engine.py`.
 
----
+For the web client, run this from `frontend/`:
 
-## Project layout
-
+```sh
+npm run lint
+npm run build
 ```
-krishiva-ai/
-├── engine/               # RAG pipeline (retrieval, generation, knowledge base)
-│   ├── knowledge_base/   #   loading, parsing, validation of KB JSON
-│   ├── indexing/         #   builds the vector index
-│   ├── retrieval/        #   embedder, vector store, BM25, reranker, formatting
-│   ├── generation/       #   language detection, diagnosis, prompt, LLM clients
-│   └── pipeline.py       #   ties it all together (KrishivaEngine)
-├── backend/              # FastAPI service
-│   ├── api/              #   routes + dependencies
-│   ├── core/             #   config, logging, middleware, error handling
-│   ├── engine_gateway/   #   adapter to the engine + deterministic stub
-│   ├── schemas/          #   HTTP request/response models
-│   └── services/         #   query service
-├── frontend/             # Next.js web client
-├── data/
-│   ├── knowledge/rice/   # the six rice-disease knowledge bases
-│   └── vector_store/     # built Qdrant index
-├── scripts/              # build_index + per-layer verification scripts
-├── tests/                # pytest suite
-└── main.py               # dev entrypoint (uvicorn)
-```
-
----
-
-## Roadmap (beyond v1)
-
-- More crops and problem categories (pests, nutrient deficiencies, weather)
-- Token streaming for the chat UI
-- Image-based diagnosis (photo upload)
-- Server-side conversation history and farm profiles (currently client-side)
-- Broader language coverage in the UI catalog
