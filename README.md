@@ -173,3 +173,7 @@ For the web client, run this from `frontend/`:
 npm run lint
 npm run build
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
